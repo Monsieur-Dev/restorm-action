@@ -1,0 +1,136 @@
+name: 'Restorm scenario'
+description: 'Run a Restorm scenario headlessly and fail the job on anything but success'
+author: 'MonsieurDev'
+
+branding:
+  icon: 'play-circle'
+  color: 'purple'
+
+inputs:
+  project:
+    description: 'Path to the .restorm project file'
+    required: true
+  scenario:
+    description: 'Scenario to run — a name, a breadcrumb path (Folder/Sub/Scenario) or an index path'
+    required: true
+  version:
+    description: >-
+      Restorm version to run (e.g. 1.0.3). Defaults to the version this action
+      is pinned to, so `@v1.2.3` and the app it runs stay in step. Set to
+      `latest` to always follow the newest release.
+    required: false
+    default: ''
+  params:
+    description: 'Scenario parameters, one `Name=value` per line'
+    required: false
+    default: ''
+  out:
+    description: 'Write the run log to this file (in addition to the job log)'
+    required: false
+    default: ''
+  args:
+    description: 'Extra arguments passed through to the Restorm CLI verbatim'
+    required: false
+    default: ''
+  cache:
+    description: >-
+      Cache the downloaded Restorm build between jobs. GitHub-hosted runners
+      start each job on a fresh VM, so without this every run re-downloads
+      ~400 MB. Set to `false` on a self-hosted runner, where the launcher's own
+      on-disk cache already survives.
+    required: false
+    default: 'true'
+
+outputs:
+  exit-code:
+    description: 'The CLI exit code — 0 success, 1 scenario failed, 2 usage, 3 not entitled'
+    value: ${{ steps.run.outputs.exit-code }}
+  log:
+    description: 'Path to the run log, when `out` was given'
+    value: ${{ steps.run.outputs.log }}
+
+runs:
+  using: composite
+  steps:
+    # The token is the one thing this action cannot supply, and the one thing
+    # whose absence produces a confusing failure three minutes into a 400 MB
+    # download. Say it here, before anything is fetched.
+    - name: Check RESTORM_TOKEN
+      shell: bash
+      run: |
+        if [ -z "${RESTORM_TOKEN:-}" ]; then
+          echo "::error title=RESTORM_TOKEN is not set::A headless run authenticates with an organization token. Create one in Restorm (account button → My CLI/CI tokens) or at my.restorm.app, store it as a repository secret, and pass it as an env var on this step."
+          exit 1
+        fi
+
+    - name: Resolve the Restorm version
+      id: version
+      shell: bash
+      run: |
+        VERSION="${{ inputs.version }}"
+        if [ -z "$VERSION" ]; then
+          # The npm package carries the app version, so the action's own pin
+          # decides what runs — that is what makes a pipeline reproducible.
+          VERSION="${{ github.action_ref }}"
+          VERSION="${VERSION#v}"
+        fi
+        case "$VERSION" in
+          ''|latest|*[!0-9.]*) VERSION=latest ;;
+        esac
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "Restorm version: $VERSION"
+
+    - name: Cache the Restorm build
+      if: inputs.cache == 'true'
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/restorm
+          ~/Library/Caches/restorm
+          ~\AppData\Local\restorm\Cache
+        key: restorm-${{ runner.os }}-${{ runner.arch }}-${{ steps.version.outputs.version }}
+
+    - name: Run the scenario
+      id: run
+      shell: bash
+      run: |
+        set -o pipefail
+        ARGS=(--open "${{ inputs.project }}" --run "${{ inputs.scenario }}" --headless --all-logs)
+        [ -n "${{ inputs.out }}" ] && ARGS+=(--out "${{ inputs.out }}")
+        while IFS= read -r line; do
+          [ -n "$line" ] && ARGS+=(--param "$line")
+        done <<< "${{ inputs.params }}"
+        # Word-splitting is intended here: `args` is a verbatim argument string.
+        # shellcheck disable=SC2206
+        EXTRA=(${{ inputs.args }})
+        ARGS+=("${EXTRA[@]}")
+
+        PKG="restorm-cli"
+        [ "${{ steps.version.outputs.version }}" != "latest" ] && PKG="restorm-cli@${{ steps.version.outputs.version }}"
+
+        # Electron needs a display even with --headless: --headless removes the
+        # window, not Chromium's need for an X server. Linux runners therefore
+        # go through xvfb; macOS and Windows have a display of their own.
+        set +e
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          sudo apt-get install -y --no-install-recommends xvfb >/dev/null 2>&1 || true
+          xvfb-run -a npx --yes "$PKG" "${ARGS[@]}"
+        else
+          npx --yes "$PKG" "${ARGS[@]}"
+        fi
+        CODE=$?
+        set -e
+
+        echo "exit-code=$CODE" >> "$GITHUB_OUTPUT"
+        [ -n "${{ inputs.out }}" ] && echo "log=${{ inputs.out }}" >> "$GITHUB_OUTPUT"
+
+        # Each code means something different to whoever reads the failed job,
+        # so name it rather than leaving them a bare number.
+        case $CODE in
+          0) echo "Scenario succeeded." ;;
+          1) echo "::error title=Scenario failed::The scenario ran and did not pass. Inspect the run log above." ;;
+          2) echo "::error title=Nothing to run::The project or the scenario could not be resolved, or an argument was rejected." ;;
+          3) echo "::error title=Not entitled::The token is missing, invalid, revoked, expired, or the plan does not include headless execution." ;;
+          *) echo "::error title=Restorm exited with $CODE::Unexpected exit code." ;;
+        esac
+        exit $CODE
